@@ -77,6 +77,9 @@ def main():
                           "'cross_load' = held-out load for test (harder, more honest).")
     ap.add_argument("--test_load", type=int, default=3,
                      help="which HP load (0-3) to hold out entirely when split_strategy=cross_load")
+    ap.add_argument("--train_noise_std", type=float, default=0.0,
+                     help="Gaussian noise std (normalized units) added to training windows only, "
+                          "re-sampled every epoch. 0.0 = no augmentation (default).")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -93,6 +96,7 @@ def main():
         seed=args.seed,
         split_strategy=args.split_strategy,
         test_load=args.test_load,
+        train_noise_std=args.train_noise_std,
     )
 
     with open(os.path.join(args.checkpoint_dir, "norm_stats.json"), "w") as f:
@@ -138,6 +142,7 @@ def main():
                 "split_strategy": args.split_strategy,
                 "test_load": args.test_load,
                 "seed": args.seed,
+                "train_noise_std": args.train_noise_std,
             }, os.path.join(args.checkpoint_dir, "best_model.pt"))
             print(f"  -> saved new best checkpoint (val_acc={val_acc:.4f})")
         else:

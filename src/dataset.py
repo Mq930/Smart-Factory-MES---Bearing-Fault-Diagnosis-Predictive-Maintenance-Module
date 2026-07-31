@@ -12,13 +12,23 @@ Key design decisions:
    1D vibration signal (default: window=1024, stride=256, i.e. 75% overlap
    within a file - overlap is fine WITHIN a split, just not ACROSS splits).
 3. Per-channel (DE accelerometer) z-score normalization, fit on train only.
+4. Optional Gaussian noise augmentation, applied ONLY to the training set
+   (never val/test), to simulate real factory-floor SNR conditions and
+   discourage the model from relying on the near-zero-noise clean lab
+   signal. See BearingWindowDataset(noise_std=...).
+
+12-CLASS PROBLEM (fault type x severity):
+   normal, {inner_race,outer_race,ball} x {007,014,021}
+   i.e. 1 + 3*3 = 10 classes total (not 12 - see CLASS_NAMES below;
+   "12-class" in project docs colloquially refers to the fault-type x
+   severity grid, but normal has no severity axis so the true count is 10).
 
 Expected input layout (produced by download_cwru.py):
     data/raw/normal_load0_97.mat
-    data/raw/inner_race_load0_105.mat
-    data/raw/outer_race_load0_130.mat
-    data/raw/ball_load0_118.mat
-    ... etc for load 0-3
+    data/raw/inner_race_007_load0_105.mat
+    data/raw/outer_race_014_load0_197.mat
+    data/raw/ball_021_load0_222.mat
+    ... etc for load 0-3, severities 007/014/021
 """
 
 import glob
@@ -32,7 +42,12 @@ import scipy.io as sio
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-CLASS_NAMES = ["normal", "inner_race", "outer_race", "ball"]
+CLASS_NAMES = [
+    "normal",
+    "inner_race_007", "inner_race_014", "inner_race_021",
+    "outer_race_007", "outer_race_014", "outer_race_021",
+    "ball_007", "ball_014", "ball_021",
+]
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
 
 WINDOW_SIZE = 1024
@@ -58,14 +73,18 @@ def load_signal(mat_path: str) -> np.ndarray:
 
 
 def parse_filename(path: str) -> Tuple[str, int]:
-    """'normal_load0_97.mat' -> ('normal', 0)"""
+    """'inner_race_007_load0_105.mat' -> ('inner_race_007', 0)
+    'normal_load1_98.mat' -> ('normal', 1)"""
     base = os.path.basename(path)
-    m = re.match(r"([a-z_]+)_load(\d)_\d+\.mat", base)
+    m = re.match(r"([a-z0-9_]+?)_load(\d)_\d+\.mat", base)
     if not m:
         raise ValueError(f"Unexpected filename format: {base}")
     cls_name, load = m.group(1), int(m.group(2))
     if cls_name not in CLASS_TO_IDX:
-        raise ValueError(f"Unknown class '{cls_name}' parsed from {base}")
+        raise ValueError(
+            f"Unknown class '{cls_name}' parsed from {base}. "
+            f"Expected one of: {CLASS_NAMES}"
+        )
     return cls_name, load
 
 
@@ -179,9 +198,21 @@ def cross_load_split(recordings: List[RecordingWindows], test_load: int = 3,
 
 
 class BearingWindowDataset(Dataset):
-    """Flattened window-level dataset built from a list of RecordingWindows."""
+    """Flattened window-level dataset built from a list of RecordingWindows.
 
-    def __init__(self, recordings: List[RecordingWindows], mean: float = None, std: float = None):
+    noise_std: if > 0, adds fresh i.i.d. Gaussian noise (mean 0, this std,
+        in NORMALIZED signal units since noise is added after z-scoring)
+        to each window on every __getitem__ call. Use this ONLY for the
+        training set - leave it at 0 for val/test so evaluation reflects
+        the clean signal and noise robustness can be measured separately
+        (see evaluate.py --eval_noise_std for a dedicated noisy-eval pass).
+        A std of 0.3-0.5 in normalized units is a reasonable "noticeably
+        noisy factory floor" starting point; tune based on how much
+        accuracy degradation you want to see/defend against.
+    """
+
+    def __init__(self, recordings: List[RecordingWindows], mean: float = None,
+                 std: float = None, noise_std: float = 0.0):
         xs, ys, groups = [], [], []
         for rec in recordings:
             xs.append(rec.windows)
@@ -191,6 +222,7 @@ class BearingWindowDataset(Dataset):
         self.X = np.concatenate(xs, axis=0).astype(np.float32)  # (N, window_size)
         self.y = np.concatenate(ys, axis=0)
         self.groups = groups
+        self.noise_std = noise_std
 
         if mean is None or std is None:
             self.mean = float(self.X.mean())
@@ -205,14 +237,18 @@ class BearingWindowDataset(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        x = torch.from_numpy(self.X[idx]).unsqueeze(0)  # (1, window_size) - single channel
+        x = self.X[idx]
+        if self.noise_std > 0:
+            x = x + np.random.normal(0.0, self.noise_std, size=x.shape).astype(np.float32)
+        x = torch.from_numpy(x).unsqueeze(0)  # (1, window_size) - single channel
         y = int(self.y[idx])
         return x, y
 
 
 def make_dataloaders(raw_dir: str, batch_size: int = 64, window_size: int = WINDOW_SIZE,
                       stride: int = DEFAULT_STRIDE, seed: int = 42, num_workers: int = 2,
-                      split_strategy: str = "group", test_load: int = 3
+                      split_strategy: str = "group", test_load: int = 3,
+                      train_noise_std: float = 0.0
                       ) -> Tuple[DataLoader, DataLoader, DataLoader, dict]:
     """
     split_strategy:
@@ -220,6 +256,11 @@ def make_dataloaders(raw_dir: str, batch_size: int = 64, window_size: int = WIND
                          Easier protocol; loads are mixed across train/val/test.
         "cross_load"  - test set is an entirely unseen load (see cross_load_split).
                          Harder, more honest measure of generalization.
+    train_noise_std:
+        Gaussian noise std (normalized-signal units) added to TRAINING
+        windows only, re-sampled every epoch. 0.0 disables augmentation
+        (default). Val/test are always clean regardless of this setting -
+        use evaluate.py's noisy-eval option to measure noise robustness.
     """
     recordings = build_recordings(raw_dir, window_size, stride)
 
@@ -232,12 +273,14 @@ def make_dataloaders(raw_dir: str, batch_size: int = 64, window_size: int = WIND
 
     print(f"Split strategy: {split_strategy}"
           + (f" (test_load={test_load})" if split_strategy == "cross_load" else ""))
+    if train_noise_std > 0:
+        print(f"Train-time Gaussian noise augmentation: std={train_noise_std} (normalized units)")
     print("Split summary (by recording / source file):")
     for name, recs in [("train", train_recs), ("val", val_recs), ("test", test_recs)]:
         ids = [r.file_id for r in recs]
         print(f"  {name}: {len(recs)} recordings -> {ids}")
 
-    train_ds = BearingWindowDataset(train_recs)
+    train_ds = BearingWindowDataset(train_recs, noise_std=train_noise_std)
     val_ds = BearingWindowDataset(val_recs, mean=train_ds.mean, std=train_ds.std)
     test_ds = BearingWindowDataset(test_recs, mean=train_ds.mean, std=train_ds.std)
 
@@ -252,6 +295,29 @@ def make_dataloaders(raw_dir: str, batch_size: int = 64, window_size: int = WIND
 
     norm_stats = {"mean": train_ds.mean, "std": train_ds.std}
     return train_loader, val_loader, test_loader, norm_stats
+
+
+def make_noisy_test_loader(raw_dir: str, mean: float, std: float, noise_std: float,
+                            batch_size: int = 64, window_size: int = WINDOW_SIZE,
+                            stride: int = DEFAULT_STRIDE, seed: int = 42, num_workers: int = 2,
+                            split_strategy: str = "group", test_load: int = 3) -> DataLoader:
+    """
+    Rebuilds the same test split as make_dataloaders() but with Gaussian
+    noise injected (using the SAME mean/std normalization stats fit on the
+    original clean training set - do not refit on noisy data). Use this to
+    measure how much accuracy degrades under simulated factory-floor noise,
+    separately from the standard clean-signal test accuracy.
+    """
+    recordings = build_recordings(raw_dir, window_size, stride)
+    if split_strategy == "group":
+        _, _, test_recs = group_split(recordings, seed=seed)
+    elif split_strategy == "cross_load":
+        _, _, test_recs = cross_load_split(recordings, test_load=test_load, seed=seed)
+    else:
+        raise ValueError(f"Unknown split_strategy: {split_strategy!r}. Use 'group' or 'cross_load'.")
+
+    noisy_test_ds = BearingWindowDataset(test_recs, mean=mean, std=std, noise_std=noise_std)
+    return DataLoader(noisy_test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
 
 if __name__ == "__main__":

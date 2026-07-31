@@ -17,7 +17,7 @@ from sklearn.metrics import (
     f1_score,
 )
 
-from dataset import make_dataloaders, CLASS_NAMES
+from dataset import make_dataloaders, make_noisy_test_loader, CLASS_NAMES
 from model import build_model
 from train import get_device
 
@@ -62,6 +62,10 @@ def main():
                      help="overrides the split strategy stored in the checkpoint, if provided")
     ap.add_argument("--test_load", type=int, default=None,
                      help="overrides the test_load stored in the checkpoint, if provided")
+    ap.add_argument("--noise_levels", type=float, nargs="*", default=[0.1, 0.3, 0.5, 0.8],
+                     help="additional Gaussian noise std levels (normalized units) to sweep over "
+                          "for a robustness curve, evaluated on top of the clean test result. "
+                          "Pass --noise_levels with no values to skip this sweep.")
     args = ap.parse_args()
 
     device = get_device()
@@ -76,7 +80,7 @@ def main():
     split_strategy = args.split_strategy if args.split_strategy is not None else ckpt.get("split_strategy", "group")
     test_load = args.test_load if args.test_load is not None else ckpt.get("test_load", 3)
 
-    _, _, test_loader, _ = make_dataloaders(
+    _, _, test_loader, norm_stats = make_dataloaders(
         raw_dir=args.raw_dir,
         batch_size=args.batch_size,
         window_size=args.window_size,
@@ -107,11 +111,42 @@ def main():
     print("Confusion matrix (rows=ground truth, cols=predicted):")
     print_confusion_matrix(cm, class_names)
 
+    # --- Noise robustness sweep ---
+    # Clean test accuracy alone doesn't tell you how the model behaves on a
+    # real, noisier factory floor. Re-evaluate the SAME test recordings with
+    # injected Gaussian noise at increasing severity to get a degradation
+    # curve. Uses the training set's mean/std (norm_stats) - never refit on
+    # noisy data, since that would defeat the point.
+    noise_results = {}
+    if args.noise_levels:
+        print("\nNoise robustness sweep (Gaussian noise added at eval time only):")
+        print(f"  {'noise_std':<12}{'accuracy':<12}{'macro_f1':<12}")
+        print(f"  {'0.0 (clean)':<12}{acc:<12.4f}{macro_f1:<12.4f}")
+        for noise_std in args.noise_levels:
+            noisy_loader = make_noisy_test_loader(
+                raw_dir=args.raw_dir,
+                mean=norm_stats["mean"],
+                std=norm_stats["std"],
+                noise_std=noise_std,
+                batch_size=args.batch_size,
+                window_size=args.window_size,
+                stride=args.stride,
+                seed=seed,
+                split_strategy=split_strategy,
+                test_load=test_load,
+            )
+            n_preds, n_labels, _ = collect_predictions(model, noisy_loader, device)
+            n_acc = (n_preds == n_labels).mean()
+            n_f1 = f1_score(n_labels, n_preds, average="macro")
+            noise_results[noise_std] = {"accuracy": float(n_acc), "macro_f1": float(n_f1)}
+            print(f"  {noise_std:<12}{n_acc:<12.4f}{n_f1:<12.4f}")
+
     results = {
         "test_accuracy": float(acc),
         "test_macro_f1": float(macro_f1),
         "confusion_matrix": cm.tolist(),
         "class_names": class_names,
+        "noise_robustness": noise_results,
     }
     out_path = os.path.join(os.path.dirname(args.checkpoint), "test_results.json")
     with open(out_path, "w") as f:
