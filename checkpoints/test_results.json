@@ -1,0 +1,36 @@
+{
+  "test_accuracy": 1.0,
+  "test_macro_f1": 1.0,
+  "confusion_matrix": [
+    [
+      1894,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      477,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      475,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      471
+    ]
+  ],
+  "class_names": [
+    "normal",
+    "inner_race",
+    "outer_race",
+    "ball"
+  ]
+}

@@ -140,6 +140,44 @@ def group_split(recordings: List[RecordingWindows], seed: int = 42,
     return train, val, test
 
 
+def cross_load_split(recordings: List[RecordingWindows], test_load: int = 3,
+                      val_frac_of_train: float = 0.2, seed: int = 42):
+    """
+    Cross-load generalization split: a much harder, more honest protocol
+    than group_split().
+
+    - TEST  = all recordings at `test_load` HP, for every class. The model
+      never sees this operating condition during training at all.
+    - TRAIN/VAL = all recordings at the remaining loads, split by recording
+      (never by window). Val is drawn from the SAME load range as train, so
+      val accuracy will typically look better than test accuracy here.
+      That gap is expected and is the point: it separates "did it memorize
+      this load's fingerprint" from "did it learn the fault physics".
+
+    With 4 loads per class (0-3 HP) and test_load=3, this leaves 3
+    recordings per class for train/val: val gets 1 recording per class,
+    train gets 2.
+    """
+    rng = np.random.RandomState(seed)
+    by_class = {}
+    for rec in recordings:
+        by_class.setdefault(rec.class_name, []).append(rec)
+
+    train, val, test = [], [], []
+    for cls_name, recs in by_class.items():
+        test_recs = [r for r in recs if r.load == test_load]
+        remaining = [r for r in recs if r.load != test_load]
+        rng.shuffle(remaining)
+
+        n_val = max(1, round(len(remaining) * val_frac_of_train)) if len(remaining) > 1 else 0
+
+        test.extend(test_recs)
+        val.extend(remaining[:n_val])
+        train.extend(remaining[n_val:])
+
+    return train, val, test
+
+
 class BearingWindowDataset(Dataset):
     """Flattened window-level dataset built from a list of RecordingWindows."""
 
@@ -173,11 +211,27 @@ class BearingWindowDataset(Dataset):
 
 
 def make_dataloaders(raw_dir: str, batch_size: int = 64, window_size: int = WINDOW_SIZE,
-                      stride: int = DEFAULT_STRIDE, seed: int = 42, num_workers: int = 2
+                      stride: int = DEFAULT_STRIDE, seed: int = 42, num_workers: int = 2,
+                      split_strategy: str = "group", test_load: int = 3
                       ) -> Tuple[DataLoader, DataLoader, DataLoader, dict]:
+    """
+    split_strategy:
+        "group"       - random split by recording, stratified by class.
+                         Easier protocol; loads are mixed across train/val/test.
+        "cross_load"  - test set is an entirely unseen load (see cross_load_split).
+                         Harder, more honest measure of generalization.
+    """
     recordings = build_recordings(raw_dir, window_size, stride)
-    train_recs, val_recs, test_recs = group_split(recordings, seed=seed)
 
+    if split_strategy == "group":
+        train_recs, val_recs, test_recs = group_split(recordings, seed=seed)
+    elif split_strategy == "cross_load":
+        train_recs, val_recs, test_recs = cross_load_split(recordings, test_load=test_load, seed=seed)
+    else:
+        raise ValueError(f"Unknown split_strategy: {split_strategy!r}. Use 'group' or 'cross_load'.")
+
+    print(f"Split strategy: {split_strategy}"
+          + (f" (test_load={test_load})" if split_strategy == "cross_load" else ""))
     print("Split summary (by recording / source file):")
     for name, recs in [("train", train_recs), ("val", val_recs), ("test", test_recs)]:
         ids = [r.file_id for r in recs]

@@ -72,6 +72,11 @@ def main():
     ap.add_argument("--stride", type=int, default=256)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--patience", type=int, default=8, help="early stopping patience (epochs)")
+    ap.add_argument("--split_strategy", choices=["group", "cross_load"], default="group",
+                     help="'group' = random file-level split (easier). "
+                          "'cross_load' = held-out load for test (harder, more honest).")
+    ap.add_argument("--test_load", type=int, default=3,
+                     help="which HP load (0-3) to hold out entirely when split_strategy=cross_load")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -86,6 +91,8 @@ def main():
         window_size=args.window_size,
         stride=args.stride,
         seed=args.seed,
+        split_strategy=args.split_strategy,
+        test_load=args.test_load,
     )
 
     with open(os.path.join(args.checkpoint_dir, "norm_stats.json"), "w") as f:
@@ -128,6 +135,9 @@ def main():
                 "model_config": {
                     "num_classes": len(CLASS_NAMES),
                 },
+                "split_strategy": args.split_strategy,
+                "test_load": args.test_load,
+                "seed": args.seed,
             }, os.path.join(args.checkpoint_dir, "best_model.pt"))
             print(f"  -> saved new best checkpoint (val_acc={val_acc:.4f})")
         else:
