@@ -25,6 +25,7 @@ matplotlib.use("Agg")  # headless - no display needed, just save PNGs
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from scipy.signal import spectrogram
 
 from dataset import make_dataloaders, CLASS_NAMES
 from grad_cam import GradCAM1D
@@ -61,6 +62,81 @@ def plot_saliency(signal: np.ndarray, cam: np.ndarray, true_class: str, pred_cla
     plt.close(fig)
 
 
+def plot_spectrogram_overlay(signal: np.ndarray, cam: np.ndarray, true_class: str,
+                              pred_class: str, confidence: float, out_path: str,
+                              fs: int = 12000):
+    """
+    IMPORTANT - what this plot actually is:
+    The saliency values (`cam`) come from the SAME 1D Grad-CAM computed on
+    the raw waveform - nothing here is a new/separate "2D Grad-CAM" pass
+    through a spectrogram-trained model. We are only changing the visual
+    backdrop the existing 1D saliency curve is painted on, from a plain
+    waveform to a spectrogram, because a spectrogram makes periodic
+    fault-impact structure easier to see at a glance (impacts show up as
+    vertical energy stripes at regular intervals). The saliency heatmap
+    below has no independent frequency-axis information - each time-bin's
+    color is the same 1D saliency value repeated down every frequency row.
+    Do not describe this output as "2D Grad-CAM" - it is 1D Grad-CAM
+    saliency overlaid on a spectrogram visualization.
+
+    fs: sampling rate in Hz. CWRU 12k Drive End data is sampled at 12,000 Hz.
+    """
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True,
+                              gridspec_kw={"height_ratios": [2, 2, 1]})
+
+    # Use sample index (0..window_size) as the x-axis on ALL THREE panels,
+    # matching plot_saliency()'s x-axis exactly, so the two PNGs for the
+    # same window are directly, visually comparable feature-for-feature.
+    # scipy.signal.spectrogram natively reports its time bins in seconds,
+    # so we convert those bin centers back to sample-index units below
+    # rather than switching the waveform panel to seconds.
+    sample_idx = np.arange(len(signal))
+
+    # --- Panel 1: raw waveform for reference ---
+    axes[0].plot(sample_idx, signal, color="#333333", linewidth=0.7)
+    correctness = "CORRECT" if true_class == pred_class else "MISCLASSIFIED"
+    axes[0].set_title(
+        f"True: {true_class}  |  Predicted: {pred_class} ({confidence:.1%} confidence)  [{correctness}]\n"
+        f"1D Grad-CAM saliency overlaid on a spectrogram (saliency has no independent frequency info)",
+        fontsize=10,
+    )
+    axes[0].set_ylabel("Amplitude")
+
+    # --- Panel 2: spectrogram with saliency-colored overlay ---
+    # nperseg chosen so we get a reasonable number of time bins across a
+    # 1024-sample window without over-smoothing; noverlap for smoother
+    # time resolution.
+    freqs, times_spec, Sxx = spectrogram(signal, fs=fs, nperseg=128, noverlap=96)
+    Sxx_db = 10 * np.log10(Sxx + 1e-12)
+    spec_sample_idx = times_spec * fs  # convert spectrogram's seconds back to sample-index units
+
+    # background: the actual spectrogram, grayscale so the saliency overlay
+    # (in color) is what draws the eye
+    axes[1].pcolormesh(spec_sample_idx, freqs, Sxx_db, shading="gouraud", cmap="gray")
+
+    # resample the 1D saliency curve (length = len(signal)) onto the
+    # spectrogram's time-bin centers, then broadcast across all frequency
+    # rows to build a 2D overlay - see docstring: this does NOT add new
+    # frequency-axis information, it's the same 1D curve repainted.
+    cam_resampled = np.interp(spec_sample_idx, sample_idx, cam)  # (n_time_bins,)
+    cam_2d = np.tile(cam_resampled, (len(freqs), 1))  # (n_freqs, n_time_bins)
+
+    overlay = axes[1].pcolormesh(spec_sample_idx, freqs, cam_2d, shading="gouraud",
+                                  cmap="inferno", alpha=0.55, vmin=0, vmax=1)
+    axes[1].set_ylabel("Frequency (Hz)")
+    fig.colorbar(overlay, ax=axes[1], label="Grad-CAM saliency (from 1D signal)", pad=0.01)
+
+    # --- Panel 3: saliency curve alone, same as the standard plot ---
+    axes[2].fill_between(sample_idx, cam, color="#d62728", alpha=0.6)
+    axes[2].set_ylabel("Saliency")
+    axes[2].set_xlabel("Sample index (within 1024-sample window) - matches the standard plot's x-axis")
+    axes[2].set_ylim(0, 1.05)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=130)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw_dir", default="../data/raw")
@@ -73,6 +149,10 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--split_strategy", choices=["group", "cross_load"], default=None)
     ap.add_argument("--test_load", type=int, default=None)
+    ap.add_argument("--sample_rate", type=int, default=12000,
+                     help="sampling rate in Hz, for spectrogram axis labeling (CWRU 12k DE = 12000)")
+    ap.add_argument("--no_spectrogram", action="store_true",
+                     help="skip the extra spectrogram-overlay plot, only generate the standard waveform plot")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -122,8 +202,16 @@ def main():
         out_path = os.path.join(args.out_dir, fname)
         plot_saliency(signal, cam, true_name, pred_name, confidence, out_path)
 
+        spec_fname = None
+        if not args.no_spectrogram:
+            spec_fname = fname.replace(".png", "_spectrogram.png")
+            spec_out_path = os.path.join(args.out_dir, spec_fname)
+            plot_spectrogram_overlay(signal, cam, true_name, pred_name, confidence,
+                                      spec_out_path, fs=args.sample_rate)
+
         summary.append({
             "file": fname,
+            "spectrogram_file": spec_fname,
             "true_class": true_name,
             "predicted_class": pred_name,
             "confidence": confidence,
