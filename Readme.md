@@ -1,3 +1,21 @@
+**Graph flow** (`graph.py`): `ingest -> aggregate_trend -> route_severity
+-> rca_report`
+- `ingest`: classifies each window in the batch individually (reuses the
+  trained checkpoint + Grad-CAM from earlier modules).
+- `aggregate_trend`: summarizes the batch into majority class, agreement
+  fraction, and mean confidence - a single noisy window can't trigger an
+  alert on its own, only a consistent trend across the batch can.
+- `route_severity`: deterministic, inspectable rules (not an LLM call) map
+  the aggregated trend to `normal` / `watch` / `alert` / `critical`, so
+  alert routing is always auditable and reproducible from the stats.
+- `rca_report`: only runs the Groq LLM call when a fault was detected. The
+  prompt is grounded in `fault_knowledge.py` (a static knowledge base of
+  real bearing fault mechanics - BPFI/BPFO/BSF impact mechanisms, typical
+  fault progression, severity-appropriate actions) plus the actual
+  aggregated classifier stats. The LLM's job is to structure and phrase a
+  report from given facts, not to invent the diagnosis or mechanical
+  explanation - this keeps RCA output grounded rather than hallucinated.
+
 ## Design notes
 - **10-class problem**: `normal` + {inner_race, outer_race, ball} x
   {007, 014, 021} severities. Much harder than the original 4-class
