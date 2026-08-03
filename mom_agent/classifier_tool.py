@@ -52,7 +52,32 @@ class BearingClassifierTool:
         self.norm_std = None
         self._load_norm_stats(checkpoint_path)
 
+        self.temperature = self._load_temperature(checkpoint_path)
+
         self.cam_tool = GradCAM1D(self.model)
+
+    def _load_temperature(self, checkpoint_path: str) -> float:
+        """
+        calibration.json is saved alongside best_model.pt by calibration.py.
+        Falls back to T=1.0 (uncalibrated) if not found, so this works with
+        checkpoints that haven't been calibrated yet - but route_severity()
+        in graph.py makes hard decisions based on confidence thresholds, so
+        running calibration.py before deploying this agent is strongly
+        recommended.
+        """
+        import json
+        calib_path = os.path.join(os.path.dirname(checkpoint_path), "calibration.json")
+        if os.path.exists(calib_path):
+            with open(calib_path) as f:
+                calib = json.load(f)
+            print(f"[BearingClassifierTool] Applying temperature scaling: T={calib['temperature']:.4f}")
+            return calib["temperature"]
+        else:
+            print(f"[BearingClassifierTool] WARNING: no calibration.json found at {calib_path}. "
+                  f"Using uncalibrated confidence (T=1.0) - route_severity()'s confidence "
+                  f"thresholds may not reflect true prediction reliability. "
+                  f"Run calibration.py to fix this.")
+            return 1.0
 
     def _load_norm_stats(self, checkpoint_path: str):
         """norm_stats.json is saved alongside best_model.pt by train.py."""
@@ -81,13 +106,25 @@ class BearingClassifierTool:
 
         for i, w in enumerate(normalized):
             x = torch.from_numpy(w.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(self.device)
-            cam, pred_idx, probs = self.cam_tool.generate(x)
 
-            all_probs = {self.class_names[j]: float(probs[j]) for j in range(len(self.class_names))}
+            # cam_tool.generate() runs its own forward pass internally and
+            # returns T=1 (uncalibrated) probs - fine for resolving which
+            # class to explain (argmax is temperature-invariant), but NOT
+            # what we want to report as confidence. We recompute calibrated
+            # probabilities from raw logits below rather than rescaling the
+            # T=1 probs post-hoc, since softmax(logits)/T != softmax(logits/T)
+            # - temperature scaling must be applied to logits BEFORE softmax.
+            cam, pred_idx, _uncalibrated_probs = self.cam_tool.generate(x)
+
+            with torch.no_grad():
+                logits = self.model(x)
+                calibrated_probs = torch.softmax(logits / self.temperature, dim=1).cpu().numpy()[0]
+
+            all_probs = {self.class_names[j]: float(calibrated_probs[j]) for j in range(len(self.class_names))}
             results.append(WindowPrediction(
                 window_index=i,
                 predicted_class=self.class_names[pred_idx],
-                confidence=float(probs[pred_idx]),
+                confidence=float(calibrated_probs[pred_idx]),
                 all_probs=all_probs,
                 cam=cam,
             ))

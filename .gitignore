@@ -1,2 +1,9 @@
-Dataset_links.md
+data/raw/*.mat
+checkpoints/*.pt
+checkpoints/*.json
+grad_cam_outputs/
+__pycache__/
+*.pyc
 venv/
+.venv/
+.env

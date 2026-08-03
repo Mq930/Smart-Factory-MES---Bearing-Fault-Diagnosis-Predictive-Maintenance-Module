@@ -23,12 +23,18 @@ from train import get_device
 
 
 @torch.no_grad()
-def collect_predictions(model, loader, device):
+def collect_predictions(model, loader, device, temperature: float = 1.0):
+    """
+    temperature: divides logits before softmax (see calibration.py). 1.0 is
+    a no-op (uncalibrated, original behavior). Predictions (argmax) are
+    identical regardless of temperature - only the confidence VALUES in
+    all_probs change.
+    """
     model.eval()
     all_preds, all_labels, all_probs = [], [], []
     for xb, yb in loader:
         xb = xb.to(device)
-        logits = model(xb)
+        logits = model(xb) / temperature
         probs = torch.softmax(logits, dim=1)
         preds = probs.argmax(dim=1).cpu().numpy()
         all_preds.append(preds)
@@ -96,7 +102,23 @@ def main():
 
     print(f"Loaded checkpoint from epoch {ckpt['epoch']} (val_acc={ckpt['val_acc']:.4f})\n")
 
-    preds, labels, probs = collect_predictions(model, test_loader, device)
+    # Apply temperature scaling if calibration.py has been run for this
+    # checkpoint (calibration.json sits alongside best_model.pt). Falls back
+    # to T=1.0 (uncalibrated, original behavior) if not found - so this is
+    # backward compatible with checkpoints that haven't been calibrated yet.
+    temperature = 1.0
+    calib_path = os.path.join(os.path.dirname(args.checkpoint), "calibration.json")
+    if os.path.exists(calib_path):
+        with open(calib_path) as f:
+            calib = json.load(f)
+        temperature = calib["temperature"]
+        print(f"Applying temperature scaling: T={temperature:.4f} "
+              f"(from {calib_path}, fit ECE {calib['ece_before']:.4f} -> {calib['ece_after']:.4f})\n")
+    else:
+        print(f"No calibration.json found at {calib_path} - using uncalibrated "
+              f"confidence (T=1.0). Run calibration.py to fit temperature scaling.\n")
+
+    preds, labels, probs = collect_predictions(model, test_loader, device, temperature=temperature)
 
     acc = (preds == labels).mean()
     macro_f1 = f1_score(labels, preds, average="macro")
@@ -135,7 +157,7 @@ def main():
                 split_strategy=split_strategy,
                 test_load=test_load,
             )
-            n_preds, n_labels, _ = collect_predictions(model, noisy_loader, device)
+            n_preds, n_labels, _ = collect_predictions(model, noisy_loader, device, temperature=temperature)
             n_acc = (n_preds == n_labels).mean()
             n_f1 = f1_score(n_labels, n_preds, average="macro")
             noise_results[noise_std] = {"accuracy": float(n_acc), "macro_f1": float(n_f1)}
@@ -147,6 +169,7 @@ def main():
         "confusion_matrix": cm.tolist(),
         "class_names": class_names,
         "noise_robustness": noise_results,
+        "temperature_applied": temperature,
     }
     out_path = os.path.join(os.path.dirname(args.checkpoint), "test_results.json")
     with open(out_path, "w") as f:
